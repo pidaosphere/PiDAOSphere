@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-scripts
+  namespace: pidaosphere
+data:
+  backup.sh: |
+    #!/bin/bash
+    
+    # Backup timestamp
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    
+    # Redis backup
+    redis-cli save
+    aws s3 cp /data/dump.rdb s3://pidaosphere-backups/redis/dump_${TIMESTAMP}.rdb
+    
+    # Contract state backup
+    solana program dump ${PROGRAM_ID} /backup/program_${TIMESTAMP}.so
+    aws s3 cp /backup/program_${TIMESTAMP}.so s3://pidaosphere-backups/contract/
+    
+    # Log backup
+    aws s3 cp /var/log/pidaosphere/ s3://pidaosphere-backups/logs/${TIMESTAMP}/ --recursive
+    
+    # Clean up old backups
+    aws s3 ls s3://pidaosphere-backups/redis/ | sort -r | tail -n +31 | awk '{print $4}' | xargs -I {} aws s3 rm s3://pidaosphere-backups/redis/{}
+    aws s3 ls s3://pidaosphere-backups/contract/ | sort -r | tail -n +31 | awk '{print $4}' | xargs -I {} aws s3 rm s3://pidaosphere-backups/contract/{}
+    aws s3 ls s3://pidaosphere-backups/logs/ | sort -r | tail -n +8 | awk '{print $4}' | xargs -I {} aws s3 rm s3://pidaosphere-backups/logs/{}
+
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: pidaosphere-backup
+  namespace: pidaosphere
+spec:
+  schedule: "0 */6 * * *"  # Run every 6 hours
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: pidaosphere/backup-tools:latest
+            command:
+            - /scripts/backup.sh
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: secret-key
+            - name: PROGRAM_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: pidaosphere-config
+                  key: program_id
+            volumeMounts:
+            - name: backup-scripts
+              mountPath: /scripts
+            - name: redis-data
+              mountPath: /data
+            - name: logs
+              mountPath: /var/log/pidaosphere
+          restartPolicy: OnFailure
+          volumes:
+          - name: backup-scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+          - name: redis-data
+            persistentVolumeClaim:
+              claimName: redis-data
+          - name: logs
+            persistentVolumeClaim:
+              claimName: log-storage
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-storage
+  namespace: pidaosphere
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials
+  namespace: pidaosphere
+type: Opaque
+stringData:
+  access-key: ${AWS_ACCESS_KEY_ID}
+  secret-key: ${AWS_SECRET_ACCESS_KEY} 
